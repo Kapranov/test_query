@@ -14,3 +14,6 @@ First off, let's create a new project `TestQuery` using the usual Mix
 build tool invocation: `mkdir test_query; cd test_query; mix new .`
 
 ### 6 November 2018 by Oleg G.Kapranov
+
+[1]: https://github.com/tonyhammond/examples/tree/master/test_query
+[2]: https://medium.com/@tonyhammond/querying-rdf-with-elixir-2378b39d65cc
