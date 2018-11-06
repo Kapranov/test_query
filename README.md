@@ -632,6 +632,475 @@ end
 Now we're ready to experiment with those functions or move on to
 something else.
 
+## Inspect result sets using the Observer
+
+So, at this point let's try something a little more ambitious.
+
+We're going to read a bunch of queries from local file storage, apply
+them against a remote service, and store the results for inspection
+using one of the really cool Erlang tools that ships with Elixir – the
+Observer.
+
+For the queries we'll use one more module attribute `@query_dir` which
+uses the Erlang function `:code.priv_dir/1` to locate the `priv/queries/`
+directory in the main module.
+
+```bash
+bash> mkdir -p priv/queries
+```
+
+```elixir
+# lib/test_query/client.ex
+defmodule TestQuery.Client do
+  @moduledoc """
+  This module provides test functions for the SPARQL.Client module.
+  """
+
+  # ...
+
+  @query_dir "#{:code.priv_dir(:test_query)}/queries/"
+
+  @service "http://dbpedia.org/sparql"
+
+  # ...
+end
+```
+
+For this application we'll just save some simple queries to be applied
+to a given service. We'll be querying DBpedia again.
+
+The queries are all the same. They are all simple SPARQL select queries,
+each querying for a particular hurricane in the 2018 Atlantic hurricane
+season.
+
+```elixir
+select *
+where {
+  bind (<http://dbpedia.org/resource/Hurricane_Alberto> as ?s)
+  ?s ?p ?o
+}
+```
+
+So we have this directory structure.
+
+```bash
+bash> tree priv/queries/
+
+priv/queries/
+├── alberto.rq
+├── beryl.rq
+├── chris.rq
+├── debby.rq
+├── ernesto.rq
+├── florence.rq
+├── gordon.rq
+└── helene.rq
+
+0 directories, 8 files
+```
+Before we get to the Observer, let's talk about the storage for query
+results. Be warned that we are going to use an advanced facility of the
+Erlang runtime.
+
+Erlang uses the actor model and implements actors as processes which are
+one of its main language constructs. These are very lightweight
+structures and are implemented at the language level – not the OS level.
+Communication between processes is strictly via message passing and
+state is private to the process.
+
+Now, Erlang also maintains a powerful storage engine built into the
+runtime. This is known as Erlang Term Storage (ETS) and is a robust
+in-memory store for Elixir and Erlang terms. Tables in ETS are created
+and owned by individual processes. When an owner process terminates, its
+tables are destroyed.
+
+There are many reasons to be wary of reaching for ETS tables for
+production applications (shared access, garbage collection, etc.) but
+for this we will use ETS tables as a simple cache mechanism to store
+our query results so that we can inspect these readily with the Observer
+tool. Note that normally one would use special process types such as a
+GenServer (or an Agent, which is basically a GenServer under the hood)
+to hold process private state. But before talking more about the
+Observer let's look first at how we will run our queries and save the
+results sets to ETS tables.
+
+We'll define a `rquery_all/0` function which will first read filenames
+from our query directory and then iterate over those, reading the query
+from the file and sending this to the service and storing the results.
+We use the `Path.wildcard/1` and `Path.basename/1` file system functions
+together with the module attribute which supplies the `/priv/queries/`
+directory. The second part uses a list comprehension to iterate over the
+`query_files` list. Note that the processing is handled by private
+functions which we explicitly label with a leading underscore.
+
+```elixir
+# lib/test_query/client.ex
+def rquery_all do
+  # get list of query files
+  query_files =
+    Path.wildcard(@query_dir <> "*.rq") |> Enum.map(&Path.basename/1)
+
+  # iterate over query files and process
+  for query_file <- query_files,
+    do: _read_query(query_file) |> _get_data
+end
+```
+
+The `_read_query/1` function is defined using `defp` for a private
+function. Our plan here is just to slurp the file contents into a
+variable `query` and to return this in a tuple together with an ETS
+table name. Here the table name is an atom holding a name compounded of
+the file name (without file extension) and with the current module as a
+prefix. So, for example, the file `alberto.rq` will be used to generate
+an ETS table name of `Elixir.TestQuery.Client.alberto`. (Note that the
+prefix `Elixir.` is implicit in all Elixir module names.)
+
+```elixir
+# lib/test_query/client.ex
+defp _read_query(query_file) do
+  # output a progress update
+  IO.puts "Reading #{query_file}"
+
+  # read query from query_file
+  query =
+    case File.open(@query_dir <> query_file, [:read]) do
+      {:ok, file} ->
+        IO.read(file, :all)
+      {:error, reason} ->
+        raise "! Error: #{reason}"
+    end
+  {query, Module.concat(__MODULE__, Path.basename(query_file, ".rq"))}
+end
+```
+
+The function return is piped into a helper function `_get_data/1` which
+just unpacks the tuple into two arguments and invokes the real
+`_get_data/2` function.
+
+
+```elixir
+# lib/test_query/client.ex
+defp _get_data({query, table_name}),
+  do: _get_data(query, table_name)
+
+defp _get_data(query, table_name) do
+  # output a progress update
+  IO.puts "Writing #{table_name}"
+
+  # create ETS table
+  :ets.new(table_name, [:named_table])
+
+  # now call SPARQL endpoint and populate ETS table
+  case SPARQL.Client.query(query, @service) do
+    {:ok, result} ->
+      result.results |> Enum.each(
+        fn t -> :ets.insert(table_name, _build_spo_tuple(t)) end
+      )
+    {:error, reason} ->
+      raise "! Error: #{reason}"
+  end
+end
+```
+
+This function uses two Erlang functions `:ets.new/2` and `:ets.insert/2`
+to create and populate the ETS table. Each result is read from the list
+of maps in the `results.result` field of the `SPARQL.Query.Result`
+struct and each map is repackaged as a tuple by the `_build_spo_tuple/1`
+function.
+
+```elixir
+# lib/test_query/client.ex
+defp _build_spo_tuple(t) do
+  s = t["s"].value
+  p = t["p"].value
+  # need to test type of object term
+  o =
+    case t["o"] do
+      %RDF.IRI{} -> t["o"].value
+      %RDF.Literal{} -> t["o"].value
+      %RDF.BlankNode{} -> t["o"].id
+      _ -> raise "! Error: Could not get type of object term"
+    end
+  {System.os_time(), s, p, o, t}
+end
+```
+
+This function just expects three keys in the triple map `t`: `"s"`, `"p"`, and
+`"o"`. Both RDF subjects and predicates are IRIs so we can just fish out
+the `value` field of the IRI struct. But RDF objects may be either IRIs,
+literals, or blank nodes. So we'll need to test those and use the `value` or
+`id` field of  the appropriate struct accordingly.
+
+Note that this testing on RDF object type is admittedly a little
+low-level and we might expect a convenience function to support this in
+a future release.
+
+We return a tuple for inserting into the ETS table using `:ets.insert/2`
+which will list subject `s`, predicate `p`, object `o`, as well as the
+raw triple map `t` that was returned. We want to include a key for each
+tuple so simply make use of the `System.os_time/0` function to provide a
+unique integer ID.
+
+And that's it!
+
+So, let's try it.
+
+```bash
+bash> make all
+
+iex> rquery_all
+#=> Reading alberto.rq
+    Writing Elixir.TestQuery.Client.alberto
+    Reading beryl.rq
+    Writing Elixir.TestQuery.Client.beryl
+    Reading chris.rq
+    Writing Elixir.TestQuery.Client.chris
+    Reading debby.rq
+    Writing Elixir.TestQuery.Client.debby
+    Reading ernesto.rq
+    Writing Elixir.TestQuery.Client.ernesto
+    Reading florence.rq
+    Writing Elixir.TestQuery.Client.florence
+    Reading gordon.rq
+    Writing Elixir.TestQuery.Client.gordon
+    Reading helene.rq
+    Writing Elixir.TestQuery.Client.helene
+    [:ok, :ok, :ok, :ok, :ok, :ok, :ok, :ok]
+```
+
+So, something happened. Let's see. For this we'll reach for the
+Observer. The Observer is a graphical tool for observing the
+characteristics of Erlang systems. The Observer displays system
+information, application supervisor trees, process information, ETS
+tables, Mnesia tables and contains a front end for Erlang tracing. Just
+a lot of things.
+
+We invoke the Observer as: `:observer.start`
+
+The Observer UI will pop up in a new window. (And to close this down we
+can just use the `:observer.stop/0` function.)
+
+Now, there's an awful lot going on here. But for the purposes of this
+tutorial we're just going to look at the Table Viewer tab.
+
+Now, we're going to inspect some tables. We might need to click on the
+Table Name header to sort the tables. For our purposes let's open the
+table we created `Elixir.TestQuery.florence`. And this is what we should
+see:
+
+Now each row can be separately inspected just by clicking on it.
+
+And just by way of showing that what we can write into an ETS table we
+can also read out. This `read_table/1` function just trivially prints
+out one of the terms (the RDF object value) stored in a table.
+Interesting here is the pattern matching on the tuple to very simply get
+at one of the terms.
+
+```elixir
+# lib/test_query/client.ex
+def read_table(table_name) do
+  :ets.tab2list(table_name) |> Enum.each(&_read_tuple/1)
+end
+
+defp _read_tuple(tuple) do
+  {_, _, _, o, _} = tuple
+  IO.puts o
+end
+```
+We can just run this as follows:
+
+```bash
+bash> make all
+
+iex> read_table(:"Elixir.TestQuery.Client.beryl")
+#=> http://en.wikipedia.org/wiki/Hurricane_Beryl
+    Hurricane Beryl
+    319222358
+    http://en.wikipedia.org/wiki/Hurricane_Beryl?oldid=319222358
+    1848146
+    nodeID://b8848505
+    http://dbpedia.org/resource/Tropical_Storm_Beryl
+    http://dbpedia.org/resource/Tropical_Storm_Beryl
+    :ok
+```
+
+Note the quoting on the ETS table name `:"Elixir.TestQuery.Client.beryl"`.
+
+The final of version `lib/test_query/client.ex`:
+
+```elixir
+defmodule TestQuery.Client do
+  @moduledoc """
+  This module provides test functions for the SPARQL.Client
+  """
+
+  alias SPARQL.Client
+
+  @hello_world "http://dbpedia.org/resource/Hello_World"
+
+  @query """
+  select *
+  where {
+    bind (<#{@hello_world}> as ?s)
+    ?s ?p ?o
+    filter (isLiteral(?o) && langMatches(lang(?o), "en"))
+  }
+  """
+
+  @query_dir "#{:code.priv_dir(:test_query)}/queries/"
+
+  @service "http://dbpedia.org/sparql"
+
+  ## Accessors for module attributes
+
+  @doc false
+  def get_query, do: @query
+
+  @doc false
+  def get_service, do: @service
+
+  ## Hello query to test access to remote RDF datastore
+
+  @doc """
+  Queries default RDF service and prints out "Hello World".
+  """
+  def hello do
+    case Client.query(@query, @service) do
+      {:ok, result} ->
+        result.results |> Enum.each(&(IO.puts &1["o"]))
+      {:error, reason} ->
+        raise "! Error: #{reason}"
+    end
+  end
+
+  ## Simple remote query functions
+
+  @doc """
+  Queries default RDF service with default SPARQL query.
+  """
+  def rquery do
+    Client.query(@query, @service)
+  end
+
+  @doc """
+  Queries default RDF service with user SPARQL query.
+  """
+  def rquery(query) do
+    Client.query(query, @service)
+  end
+
+  @doc """
+  Queries a user RDF service with a user SPARQL query.
+  """
+  def rquery(query, service) do
+    Client.query(query, service)
+  end
+
+  ## Demo of multiple SPARQL queries: from RQ files to ETS tables
+
+  @doc """
+  Queries default RDF service with saved SPARQL queries.
+
+  This function also stores results in per-query ETS tables.
+  """
+  def rquery_all do
+    # get list of query files
+    query_files =
+      Path.wildcard(@query_dir <> "*.rq") |> Enum.map(&Path.basename/1)
+
+    # iterate over query files and process
+    for query_file <- query_files,
+      do: _read_query(query_file) |> _get_data
+  end
+
+  @doc """
+  Reads RDF data from ETS table and prints it.
+  """
+  def read_table(table_name) do
+    :ets.tab2list(table_name) |> Enum.each(&_read_tuple/1)
+  end
+
+  @doc false
+  defp _read_query(query_file) do
+    # output a progress update
+    IO.puts "Reading #{query_file}"
+
+    # read query from query_file
+    query =
+      case File.open(@query_dir <> query_file, [:read]) do
+        {:ok, file} ->
+          IO.read(file, :all)
+        {:error, reason} ->
+          raise "! Error: #{reason}"
+      end
+    {query, Module.concat(__MODULE__, Path.basename(query_file, ".rq"))}
+  end
+
+  @doc false
+  defp _get_data({query, table_name}),
+    do: _get_data(query, table_name)
+
+  @doc false
+  defp _get_data(query, table_name) do
+    # output a progress update
+    IO.puts "Writing #{table_name}"
+
+    # create ETS table
+    :ets.new(table_name, [:named_table])
+
+    # now call SPARQL endpoint and populate ETS table
+    case Client.query(query, @service) do
+      {:ok, result} ->
+        result.results |> Enum.each(
+          fn t -> :ets.insert(table_name, _build_spo_tuple(t)) end
+        )
+      {:error, reason} ->
+        raise "! Error: #{reason}"
+    end
+  end
+
+  @doc false
+  defp _build_spo_tuple(t) do
+    s = t["s"].value
+    p = t["p"].value
+    # need to test type of object term
+    o =
+      case t["o"] do
+        %RDF.IRI{} -> t["o"].value
+        %RDF.Literal{} -> t["o"].value
+        %RDF.BlankNode{} -> t["o"].id
+        _ -> raise "! Error: Could not get type of object term"
+      end
+    {System.os_time(), s, p, o, t}
+  end
+
+  @doc false
+  defp _read_tuple(tuple) do
+    {_, _, _, o, _} = tuple
+    IO.puts o
+  end
+end
+```
+
+It's shown here how the `SPARQL.ex` and `SPARQL.Client.ex` packages can
+be used for querying RDF datastores in Elixir.
+
+Specifically we've used `SPARQL.ex` to query local (in-memory) RDF
+models, and provided some convenience functions for further exploration.
+We then used `SPARQL.Client.ex` to query remote RDF datastores and again
+provided some convenience functions for further testing.
+
+We then proceeded to develop a small demo which read stored SPARQL
+queries, applied them to a remote SPARQL endpoint and then saved the
+results in the Erlang runtime as ETS tables to inspect the result sets
+using the wonderful Observer tool.
+
+Introducing the Observer brings us that little closer to the Erlang
+system in flight with its process tree. It is this very granular process
+model which allows us to think about new solutions using a distributed
+compute paradigm for semantic web applications. I hope to be able to
+follow up on some of this promise in future it.
+
 ### 6 November 2018 by Oleg G.Kapranov
 
 [1]: https://github.com/tonyhammond/examples/tree/master/test_query
