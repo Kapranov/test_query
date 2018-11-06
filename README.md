@@ -401,6 +401,237 @@ iex> exports TestQuery
 #=> data/0      query/0     query/1     query/2
 ```
 
+## Query remote RDF models
+
+To query a remote RDF datastore let's set up a new `TestQuery.Client`
+module for our testing with `SPARQL.Client`. We'll add a new directory
+`lib/test_query/` and create a `client.ex` file for the module.
+
+```bash
+bash> mkdir -p lib/test_query
+bash> touch lib/test_query/client.ex
+bash> cat << 'EOF' > lib/test_query/client.ex
+defmodule TestQuery.Client do
+  @moduledoc """
+  This module provides test functions for the SPARQL.Client
+  """
+
+end
+EOF
+```
+We're going to be using DBpedia and the DBpedia SPARQL endpoint for our
+remote querying.  Let's define some module attributes to make things
+easier.
+
+```elixir
+# lib/test_query/client.ex
+defmodule TestQuery.Client do
+  @moduledoc """
+  This module provides test functions for the SPARQL.Client module.
+  """
+
+  @hello_world "http://dbpedia.org/resource/Hello_World"
+
+  @query """
+  select *
+  where {
+    bind (<#{@hello_world}> as ?s)
+    ?s ?p ?o
+    filter (isLiteral(?o) && langMatches(lang(?o), "en"))
+  }
+  """
+
+  @service "http://dbpedia.org/sparql"
+end
+```
+
+Where's here?
+
+* `@hello_word` - a test URI, here a DBpedia resource
+* `@query` - a test SPARQL query using the test URI and matching
+             English-language strings for RDF object literal values
+* `@service` - a test SPARQL endpoint, here the DBpedia endpoint
+
+Module attributes are private to the module but we can define a couple
+of accessor functions:
+
+```elixir
+## Accessors for module attributes
+
+def get_query, do: @query
+def get_service, do: @service
+```
+
+Let's define a `hello/0` function which will use the
+`SPARQL.Client.query/2` function to query the test service
+(`@service`) with the test query (`@query`).
+
+```elixir
+def hello do
+  case SPARQL.Client.query(@query, @service) do
+    {:ok, result} ->
+      result.results |> Enum.each(&(IO.puts &1["o"]))
+    {:error, reason} ->
+      raise "! Error: #{reason}"
+  end
+end
+```
+
+As before the query result is a `SPARQL.Query.Result` struct, or more
+precisely a tuple with an `:ok` atom and the struct which we'll save
+to the variable `result`. We can access the actual results (a list of
+maps) from the `results` field of the `result` struct and we can pipe
+those into `Enum.each/2`, an Elixir enumerable function. Again we use
+the partial function application `&(IO.puts &1["o"])` to print out RDF
+object values.
+
+```elixir
+# .iex.exs
+import TestQuery
+import TestQuery.Client
+```
+
+```elixir
+# lib/test_query/client.ex
+defmodule TestQuery.Client do
+  @moduledoc """
+  This module provides test functions for the SPARQL.Client
+  """
+
+  alias SPARQL.Client
+
+  @hello_world "http://dbpedia.org/resource/Hello_World"
+
+  @query """
+  select *
+  where {
+    bind (<#{@hello_world}> as ?s)
+    ?s ?p ?o
+    filter (isLiteral(?o) && langMatches(lang(?o), "en"))
+  }
+  """
+
+  @service "http://dbpedia.org/sparql"
+
+  def get_query, do: @query
+  def get_service, do: @service
+
+  @doc """
+  Queries default RDF service and prints out "Hello World".
+  """
+  def hello do
+    case Client.query(@query, @service) do
+      {:ok, result} ->
+        result.results |> Enum.each(&(IO.puts &1["o"]))
+      {:error, reason} ->
+        raise "! Error: #{reason}"
+    end
+  end
+end
+```
+
+So, let's try it
+
+```bash
+bash> make all
+iex> hello
+#=> Hello World
+```
+
+Great. We just queried DBpedia and parsed the result set for English
+language strings.
+
+So we can now define some functions for remote query (`rquery/0`,
+`rquery/1`, `rquery/2`) which mirror the local query forms (`query/0`,
+`query/1`, `query/2`) we produced earlier.
+
+```elixir
+def rquery do
+  SPARQL.Client.query(@query, @service)
+end
+
+def rquery(query) do
+  SPARQL.Client.query(query, @service)
+end
+
+def rquery(query, service) do
+  SPARQL.Client.query(query, service)
+end
+```
+
+And again let's check on the functions we have now created with the
+`IEx.Helpers.exports/1` function.
+
+```bash
+exports TestQuery.Client
+#=> get_query/0       get_service/0     hello/0           rquery/0
+    rquery/1          rquery/2
+```
+
+```elixir
+# lib/test_query/client.ex
+defmodule TestQuery.Client do
+  @moduledoc """
+  This module provides test functions for the SPARQL.Client
+  """
+
+  @hello_world "http://dbpedia.org/resource/Hello_World"
+
+  @query """
+  select *
+  where {
+    bind (<#{@hello_world}> as ?s)
+    ?s ?p ?o
+    filter (isLiteral(?o) && langMatches(lang(?o), "en"))
+  }
+  """
+
+  @service "http://dbpedia.org/sparql"
+
+  ## Accessors for module attributes
+
+  def get_query, do: @query
+  def get_service, do: @service
+
+  @doc """
+  Queries default RDF service and prints out "Hello World".
+  """
+  def hello do
+    case SPARQL.Client.query(@query, @service) do
+      {:ok, result} ->
+        result.results |> Enum.each(&(IO.puts &1["o"]))
+      {:error, reason} ->
+        raise "! Error: #{reason}"
+    end
+  end
+
+  ## Simple remote query functions
+
+  @doc """
+  Queries default RDF service with default SPARQL query.
+  """
+  def rquery do
+    SPARQL.Client.query(@query, @service)
+  end
+
+  @doc """
+  Queries default RDF service with user SPARQL query.
+  """
+  def rquery(query) do
+    SPARQL.Client.query(query, @service)
+  end
+
+  @doc """
+  Queries a user RDF service with a user SPARQL query.
+  """
+  def rquery(query, service) do
+    SPARQL.Client.query(query, service)
+  end
+end
+```
+Now we're ready to experiment with those functions or move on to
+something else.
+
 ### 6 November 2018 by Oleg G.Kapranov
 
 [1]: https://github.com/tonyhammond/examples/tree/master/test_query
